@@ -67,6 +67,7 @@ void dns_error(char *msg);
 void gai_error(int code, char *msg);
 void app_error(char *msg);
 void err_exit(const char *msg);
+void thread_err_exit(const char *msg);
 
 /* Process control wrappers */
 pid_t Fork(void);

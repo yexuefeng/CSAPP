@@ -5,71 +5,26 @@
 #include <sys/socket.h>
 #include <netdb.h>
 #include <signal.h>
+#include <sys/epoll.h>
 
 #include "csapp.h"
-#include "robust_io.h"
-#include "sbuf.h"
 #include "cache.h"
+#include "queue.h"
+#include "ConnectionOperation.h"
 
 /* Recommended max cache and object sizes */
 
 #define THREAD_NUM 4
+#define MAX_FILENO_PER_THREAD 64
+#define MAX_EVENTS MAX_FILENO_PER_THREAD
 
 pthread_t tid[THREAD_NUM];
-extern sbuf_t sbuffer;
+
 
 void* proxy_thread(void *argv);
 
 /* You won't lose style points for including this long line in your code */
 static const char *user_agent_hdr = "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:10.0.3) Gecko/20120305 Firefox/10.0.3\r\n";
-
-
-/*
- * parse_url - Parse the url in the http request. Return 0 if success, or -1
- *             if the request is malformed or malicious.
- */
-int parse_url(const char *request, char *hostname, char *uri, char *port)
-{
-    char buf[MAXLINE];
-    char *first, *ptr, *end;
-    
-    strncpy(buf, request, MAXLINE);
-    end = buf + strlen(buf);
-    if ((first = strstr(buf, "//")))
-    {
-        first += 2;
-        /* Parse hostname and port */
-        if ((ptr = strchr(first, ':')))
-        {
-            *ptr = ' ';
-            if ((ptr = strchr(first, '/')))
-            {
-                *ptr = '\0';
-            }
-            sscanf(first, "%s %s", hostname, port);
-        }
-        else
-        {
-            if ((ptr = strchr(first, '/')))
-            {
-                *ptr = '\0';
-            }
-            sscanf(first, "%s", hostname);
-            strcpy(port, "80");
-        }
-        
-        /* Parse uri */
-        strcpy(uri, "/");
-        if (ptr != NULL && ptr < end)
-        {
-            strcat(uri, ptr + 1);
-        }
-        
-        return 0;
-    }
-    
-    return -1;
-}
 
 void make_request_packet(char *request,
                          char *method,
@@ -82,124 +37,6 @@ void make_request_packet(char *request,
     sprintf(request, "%s%s", request, user_agent_hdr);
     sprintf(request, "%sConnection: close\r\n", request);
     sprintf(request, "%sProxy-Connection: close\r\n\r\n", request);
-}
-
-static void handle_get(int connfd,
-                       char *url,
-                       char *method,
-                       char *hostname,
-                       char *uri,
-                       char *port)
-{
-    int clientfd;
-    char request[MAXLINE];
-    char response[MAXLINE];
-    char *content;
-    ssize_t nread;
-    ssize_t nwrite;
-    int size;
-    
-    /*First we should search in the cache*/
-    if ((content = search_in_cache(url)))
-    {
-        printf("%s(%d) Get content from cache\n", __func__, __LINE__);
-        nwrite = ro_write(connfd, content, strlen(content));
-        if (nwrite != strlen(content))
-        {
-            printf("%s(%d) Warning short count in write process\n",
-                   __func__, __LINE__);
-        }
-        
-        free(content);
-        return;
-    } 
-    /*
-     * If the request url not found in cache, then we should forward the request to the 
-     * remote web server.
-     */
-    if ((clientfd = open_clientfd(hostname, port)) < 0)
-    {
-        printf("open_clientfd error");
-        return;
-    }
-   
-    make_request_packet(request, method, hostname, uri, port);
-    
-    nwrite = ro_write(clientfd, request, strlen(request));
-
-    /* Wait for response */
-    memset(&response, 0, sizeof(response));
-    size = 0;
-    if ((content = calloc(MAX_OBJECT_SIZE, 1)) == NULL)
-    {
-        close(clientfd);
-        return;
-    }
-
-    while (1)
-    {
-        nread = read(clientfd, response, MAXLINE);
-        if (nread > 0)
-        {
-            ro_write(connfd, response, nread);
-            size += nread;
-            if (size <= MAX_OBJECT_SIZE)
-            {
-                strncpy(content + size - nread, response, nread);
-            }
-        }
-        else if (nread < 0)
-        {
-            if (errno == EINTR)
-                continue;
-            else            /* Error occured */
-                break;
-        }
-        else  /* EOF, means peer client has closed this connection */
-            break;
-    }
-    
-    if (size > 0 && size <= MAX_OBJECT_SIZE) 
-        insert_in_cache(url, content, size);
-
-    /* Safely closed the connection */
-    free(content);
-    close(clientfd);
-}
-
-/*
- * receive_request_from_client - Receive http request from client.
- */
-void receive_request_from_client(int connfd)
-{
-    char method[MAXLINE], version[MAXLINE], url[MAXLINE];
-    char request[MAXLINE]; 
-    char hostname[MAXLINE], uri[MAXLINE], port[MAXLINE];
-    ssize_t nread;
-    int flags;
-    
-    fcntl(connfd, F_GETFL, &flags);
-    flags |= O_NONBLOCK; 
-    fcntl(connfd, F_SETFL, O_NONBLOCK);
-
-    while ((nread = ro_read(connfd, request, MAXLINE)) >= 0)
-    {
-        if (nread > 0)
-        {
-            sscanf(request, "%s %s %s", method, url, version);
-            if (parse_url(url, hostname, uri, port) == -1)
-            {
-                /* Parse url failed*/
-                break;
-            }
-            
-            if (!strcasecmp(method, "GET"))
-            {
-                handle_get(connfd, url, "GET", hostname, uri, port);
-                break;
-            }
-        }
-    }
 }
 
 /*
@@ -226,7 +63,10 @@ int main(int argc, char *argv[])
     struct sockaddr_in clientaddr;
     char hostname[MAXLINE], port[MAXLINE];
     socklen_t addrlen;
+    Queue *queue;
+    Queue **queue_array;
     int ret;
+    int index = 0;
 
     if (argc < 2)
     {
@@ -239,14 +79,16 @@ int main(int argc, char *argv[])
     } 
     set_socket_reuse(listenfd);
 
-    sbuf_init(&sbuffer, 64);
     init_cache();
     signal(SIGPIPE, SIG_IGN);
 
-    /* Create thread pool */ 
+    /* Create thread pool */
+    queue_array = malloc(sizeof(Queue*));
     for (i = 0; i < THREAD_NUM; i++)
     {
-        pthread_create(&tid[i], NULL, proxy_thread, NULL);
+        queue = queue_create(NULL, NULL);
+        queue_array[i] = queue;
+        pthread_create(&tid[i], NULL, proxy_thread, (void*)queue);
     }
     
     addrlen = sizeof(clientaddr);
@@ -257,37 +99,185 @@ int main(int argc, char *argv[])
         {
             err_exit("accept error");
         }
-        
+         
         if ((ret = getnameinfo((struct sockaddr*)&clientaddr, addrlen, 
                         hostname, MAXLINE, port, MAXLINE, 0)))
         {
             fprintf(stderr, "getnameinfo error, code %d\n", ret);
             exit(-1); 
         }
-        printf("%s(%d) Connection from %s:%s\n",
-                __func__, __LINE__, hostname, port);
-        sbuf_insert(&sbuffer, connfd);
+
+        printf("%s(%d) Connection from %s:%s, fd: %d\n",
+                __func__, __LINE__, hostname, port, connfd); 
+        queue_push(queue_array[index], (void*)connfd);
+        index = (index + 1) % THREAD_NUM;
     }
 
     close(listenfd);
-    sbuf_deinit(&sbuffer);
     return 0;
 }
 
+void handle_event(DList* connectionTable, struct epoll_event *ev, int epfd)
+{
+    int fd = ev->data.fd;
+    struct connection* conn = NULL;
+    
+    if ((conn = find_connection(connectionTable, fd)) == NULL)
+    {
+        if (ev->events & EPOLLIN)
+            get_new_connection(connectionTable, epfd, fd);
+        return;
+    }
+
+    if ((ev->events & EPOLLIN) && (conn->state == ALL_CONNECTION))
+    {
+        if (read_from_connection(conn, epfd) != 0)
+        {
+            struct connection* pair = conn->pair;
+            delete_connection(connectionTable, conn);
+
+            if (pair->size == 0)
+            {
+                /*
+                 * If no data needs to forward, we should delete the peer connection
+                 */
+                char buf[64];
+
+                /*Wait peer closed the connection*/
+                shutdown(pair->fd, SHUT_WR);
+                while (read(pair->fd, buf, 64) != 0) continue; 
+                delete_connection(connectionTable, pair);
+            }
+            else
+            {
+                /*
+                 * If remain data to forward, we should set the state of pair
+                 * HALF_FINISH_CONNECTION, then when send all data, we will delete
+                 * the pair connection.
+                 */
+                conn->pair->state = HALF_FINISH_CONNECTION;
+            }
+        }
+    }
+    else if ((ev->events & EPOLLIN) && (conn->state == HALF_CONNECTION))
+    {
+        if (read_from_half_connection(connectionTable, conn, epfd) != 0)
+        {
+            delete_connection(connectionTable, conn);
+        }
+    }
+    else if (ev->events & EPOLLOUT)
+    {
+        struct epoll_event event;
+
+        if (write_to_connection(conn, epfd) < 0)
+        {
+            /*
+             * Set conn->size = 0 just discard the data.
+             */
+            if (conn->pair)
+                shutdown(conn->pair->fd, SHUT_WR);
+            conn->size = 0;
+        }
+
+        /*
+         * If no data needs to send, disable write of the connection
+         */
+        if (conn->size == 0)
+        {
+            /* 
+             * The pair connection has closed and we have send all data, so
+             * delete the connection
+             */
+            if (conn->state == HALF_FINISH_CONNECTION)
+            {
+                char buf[64];
+                shutdown(conn->fd, SHUT_WR);
+                while (read(conn->fd, buf, 64) != 0) continue; 
+                delete_connection(connectionTable, conn);
+                return;
+            }
+
+            memset(&event, 0, sizeof(event));
+            event.data.fd = conn->fd;
+            event.events = EPOLLIN;
+            if (epoll_ctl(epfd, EPOLL_CTL_MOD, conn->fd, &event) == -1)
+            {
+                fprintf(stderr, "epoll_ctl error\n");
+                return;
+            }
+        }
+    }
+    else if (ev->events & (EPOLLHUP | EPOLLERR))
+    {
+        fprintf(stderr, "closing connection: %d\n", conn->fd);
+        delete_connection(connectionTable, conn);
+    } 
+}
+
+
 void* proxy_thread(void *varg)
 {
-    pthread_detach(pthread_self());
     int i;
+    Queue *thiz = (Queue*)varg;
+    DList *connectionTable;
+    int epfd;
+    int connfd;
+    struct epoll_event evlists[MAX_EVENTS];
+    int timeout = 10000; //1 second
+    int ready;
+    
+    pthread_detach(pthread_self());
 
-    while (1)
+    if ((connectionTable = init_connection_table()) == NULL)
+        thread_err_exit("init_connection_table error");
+
+    if ((epfd = epoll_create(MAX_FILENO_PER_THREAD)) != -1)
     {
-        int connfd = sbuf_remove(&sbuffer);
-        for (i = 0; i < THREAD_NUM; i++)
+        while (1)
         {
-            if (pthread_equal(tid[i], pthread_self()))
-                printf("Pthread %d handle connfd %d\n", i, connfd);
+            struct epoll_event ev;
+
+            /* 
+             * Add all the file descriptors in the queue to the "interest
+             * list" for the epoll instance
+             * 
+             */
+            while ((connfd = (int)queue_pop(thiz)))
+            {
+                set_fd_nonblock(connfd);
+                if (add_epoll_event(epfd, connfd) == -1)
+                    fprintf(stderr, "add_epoll_event failed\n");
+            }
+            
+            ready = epoll_wait(epfd, evlists, MAX_EVENTS, timeout); 
+            if (ready == -1) /* Error occured */
+            {
+                if (errno == EINTR)
+                {
+                    continue;
+                }
+                else
+                {
+                    thread_err_exit("epoll_wait error");
+                }
+            }
+            else if (ready == 0) /* Timeout */
+            {
+                printf("epoll_wait timeout\n");
+                continue;
+            }
+            else                 /* some events happened */
+            {
+                for (i = 0; i < ready; i++)
+                {
+                    handle_event(connectionTable, &evlists[i], epfd);
+                }
+            }
         }
-        receive_request_from_client(connfd);
-        close(connfd);
     }    
+    
+    deinit_connection_table(connectionTable);
+
+    return NULL;
 }

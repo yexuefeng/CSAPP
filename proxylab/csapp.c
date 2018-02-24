@@ -64,6 +64,13 @@ void err_exit(const char *msg)
     exit(0);
 }
 
+void thread_err_exit(const char *msg)
+{
+    int save_errno = errno;
+    fprintf(stderr, "%s, %s\n", msg, strerror(save_errno));
+    pthread_exit(0);
+}
+
 
 /*********************************************
  * Wrappers for Unix process control functions
@@ -961,10 +968,13 @@ int open_clientfd(char *hostname, char *port) {
         /* Create a socket descriptor */
         if ((clientfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) < 0) 
             continue; /* Socket failed, try the next */
-
+        
         /* Connect to the server */
         if (connect(clientfd, p->ai_addr, p->ai_addrlen) != -1) 
+        {
             break; /* Success */
+        }
+
         if (close(clientfd) < 0) { /* Connect failed, try another */  //line:netp:openclientfd:closefd
             fprintf(stderr, "open_clientfd: close failed: %s\n", strerror(errno));
             return -1;
